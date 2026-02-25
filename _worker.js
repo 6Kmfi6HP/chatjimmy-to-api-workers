@@ -9,7 +9,8 @@
 
 const CHATJIMMY_API_URL = "https://chatjimmy.ai/api/chat";
 const DEFAULT_MODEL = "llama3.1-8B";
-const CHUNK_SIZE = 5;
+const CHUNK_SIZE = 32;
+const UPSTREAM_TIMEOUT_MS = 15000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -131,21 +132,39 @@ function chunkify(text, size) {
 
 // ─── ChatJimmy API ────────────────────────────────────────────────────────────
 
+function makeAbortSignal(timeoutMs) {
+  var controller = new AbortController();
+  var timer = setTimeout(function () {
+    controller.abort("upstream timeout");
+  }, timeoutMs || UPSTREAM_TIMEOUT_MS);
+  return { signal: controller.signal, clear: function () { clearTimeout(timer); } };
+}
+
 async function callChatJimmy(req, debug) {
   var body = JSON.stringify(req);
   if (debug) console.log("[ChatJimmy Request]", body);
 
-  var res = await fetch(CHATJIMMY_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept":        "*/*",
-      "Origin":        "https://chatjimmy.ai",
-      "Referer":       "https://chatjimmy.ai/",
-      "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-    body: body,
-  });
+  var abortCtl = makeAbortSignal(UPSTREAM_TIMEOUT_MS);
+  var start = Date.now();
+  var res;
+  try {
+    res = await fetch(CHATJIMMY_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept":        "*/*",
+        "Origin":        "https://chatjimmy.ai",
+        "Referer":       "https://chatjimmy.ai/",
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      body: body,
+      signal: abortCtl.signal,
+    });
+  } finally {
+    abortCtl.clear();
+  }
+
+  var upstreamLatency = Date.now() - start;
 
   if (!res.ok) {
     var errBody = "";
@@ -159,7 +178,44 @@ async function callChatJimmy(req, debug) {
   if (!text || text.trim() === "") {
     throw new Error("ChatJimmy returned empty response");
   }
-  return text;
+
+  return { text: text, upstreamLatencyMs: upstreamLatency };
+}
+
+async function callChatJimmyStream(req, debug) {
+  var body = JSON.stringify(req);
+  if (debug) console.log("[ChatJimmy Request(stream)]", body);
+
+  var abortCtl = makeAbortSignal(UPSTREAM_TIMEOUT_MS);
+  var start = Date.now();
+  var res;
+  try {
+    res = await fetch(CHATJIMMY_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept":        "*/*",
+        "Origin":        "https://chatjimmy.ai",
+        "Referer":       "https://chatjimmy.ai/",
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      body: body,
+      signal: abortCtl.signal,
+    });
+  } finally {
+    abortCtl.clear();
+  }
+
+  var upstreamLatency = Date.now() - start;
+
+  if (!res.ok) {
+    var errBody = "";
+    try { errBody = await res.text(); } catch(e) {}
+    throw new Error("ChatJimmy " + res.status + ": " + (errBody || res.statusText));
+  }
+
+  if (!res.body) throw new Error("ChatJimmy stream body is empty");
+  return { body: res.body, upstreamLatencyMs: upstreamLatency };
 }
 
 // ─── Build Request ────────────────────────────────────────────────────────────
@@ -223,13 +279,14 @@ function makeCompletion(raw, model) {
   };
 }
 
-function makeStreamResponse(raw, model) {
-  var content = cleanContent(raw);
+function makeStreamResponseFromUpstream(upstreamBody, model, upstreamLatencyMs, startedAt) {
   var id      = generateId();
   var created = Math.floor(Date.now() / 1000);
   var enc     = new TextEncoder();
+  var dec     = new TextDecoder();
   var ts      = new TransformStream();
   var writer  = ts.writable.getWriter();
+  var reader  = upstreamBody.getReader();
 
   function emit(delta, finish) {
     var payload = JSON.stringify({
@@ -243,29 +300,65 @@ function makeStreamResponse(raw, model) {
   }
 
   (async function () {
+    var carry = "";
     try {
       await emit({ role: "assistant" });
-      var chunks = chunkify(content);
-      for (var i = 0; i < chunks.length; i++) {
-        await emit({ content: chunks[i] });
+
+      while (true) {
+        var result = await reader.read();
+        if (result.done) break;
+
+        var text = dec.decode(result.value, { stream: true });
+        if (!text) continue;
+
+        carry += text;
+        var safe = carry
+          .replace(THINK_RE, "")
+          .replace(STATS_TAG_RE, "");
+
+        if (safe.length < CHUNK_SIZE) {
+          carry = safe;
+          continue;
+        }
+
+        var chunks = chunkify(safe, CHUNK_SIZE);
+        carry = chunks.pop() || "";
+        for (var i = 0; i < chunks.length; i++) {
+          if (chunks[i]) await emit({ content: chunks[i] });
+        }
       }
+
+      carry += dec.decode();
+      var tail = cleanContent(carry);
+      if (tail) {
+        var lastChunks = chunkify(tail, CHUNK_SIZE);
+        for (var j = 0; j < lastChunks.length; j++) {
+          if (lastChunks[j]) await emit({ content: lastChunks[j] });
+        }
+      }
+
       await emit({}, "stop");
       await writer.write(enc.encode("data: [DONE]\n\n"));
     } catch (e) {
-      // 流中途出错时尝试发送错误 chunk
       try {
         var errPayload = "data: " + JSON.stringify({ error: { message: String(e) } }) + "\n\n";
         await writer.write(enc.encode(errPayload));
         await writer.write(enc.encode("data: [DONE]\n\n"));
-      } catch (_) { /* writer 已关闭则忽略 */ }
+      } catch (_) {}
     } finally {
+      try { reader.releaseLock(); } catch (_) {}
       try { writer.close(); } catch (_) {}
     }
   })();
 
-  return new Response(ts.readable, {
-    headers: Object.assign({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache" }, CORS),
-  });
+  var headers = Object.assign({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "X-Upstream-Latency-Ms": String(upstreamLatencyMs || 0),
+    "X-Proxy-Start-Ms": String(Date.now() - (startedAt || Date.now())),
+  }, CORS);
+
+  return new Response(ts.readable, { headers: headers });
 }
 
 // ─── Route Handlers ───────────────────────────────────────────────────────────
@@ -303,12 +396,13 @@ async function routeHealth() {
       chatOptions: { selectedModel: DEFAULT_MODEL, systemPrompt: "", topK: 1 },
       attachment: null,
     };
-    var raw = await callChatJimmy(testReq, false);
+    var ret = await callChatJimmy(testReq, false);
     return jsonResp({
       status: "ok",
       upstream: "chatjimmy.ai",
       latency_ms: Date.now() - start,
-      response_length: raw.length,
+      upstream_latency_ms: ret.upstreamLatencyMs,
+      response_length: ret.text.length,
     });
   } catch (e) {
     return jsonResp({
@@ -341,19 +435,25 @@ async function routeChat(request, debug) {
   var model    = body.model || DEFAULT_MODEL;
   var isStream = !!body.stream;
 
-  var raw;
+  var startedAt = Date.now();
+
   try {
-    raw = await callChatJimmy(jimmyReq, debug);
+    if (isStream) {
+      var streamRet = await callChatJimmyStream(jimmyReq, debug);
+      return makeStreamResponseFromUpstream(streamRet.body, model, streamRet.upstreamLatencyMs, startedAt);
+    }
+
+    var ret = await callChatJimmy(jimmyReq, debug);
+    var response = jsonResp(makeCompletion(ret.text, model));
+    response.headers.set("X-Upstream-Latency-Ms", String(ret.upstreamLatencyMs || 0));
+    response.headers.set("X-Total-Latency-Ms", String(Date.now() - startedAt));
+    return response;
   } catch (e) {
     // ★ 流式错误用 SSE 格式，非流式用 JSON —— 这是 [undefined] 的根本修复
     return isStream
       ? sseErrResp(String(e))
       : errResp(String(e), 502, "upstream_error");
   }
-
-  return isStream
-    ? makeStreamResponse(raw, model)
-    : jsonResp(makeCompletion(raw, model));
 }
 
 // ─── Main Export ──────────────────────────────────────────────────────────────
